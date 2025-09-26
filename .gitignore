@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.bak
+*.orig
+*.swp
+*.swo
+*.lock
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pylint.d/
+.python-version
+.env
+*.env
+
+# Virtual environments
+helloLondon/
+.venv/
+venv/
+
+# Data and artifacts
+data/
+outputs/
+logs/
+temp/
+archive_org_collector.log
+wandb/
+05_evaluation/quick_results*/
+06_inference/chat_logs/
+
+# Models & checkpoints
+09_models/tokenizers/
+09_models/checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.code-workspace
+Thumbs.db
+ehthumbs.db
+$RECYCLE.BIN/

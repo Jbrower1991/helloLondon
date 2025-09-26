@@ -15,6 +15,7 @@ import inspect
 from pathlib import Path
 from contextlib import nullcontext
 from typing import Dict, Any, Optional
+import platform
 
 # Suppress tokenizer parallelism warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -241,24 +242,42 @@ class SimpleMLP(torch.nn.Module):
 class SimpleLondonHistoricalTrainer:
     """Simple trainer based on nanoGPT approach"""
     
-    def __init__(self, data_dir: str, tokenizer_dir: str, output_dir: str, resume_from_checkpoint: str = None):
+    def __init__(
+        self,
+        data_dir: str,
+        tokenizer_dir: str,
+        output_dir: str,
+        resume_from_checkpoint: str = None,
+        # Optional quick-run overrides
+        corpus_path: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        block_size: Optional[int] = None,
+        max_iters: Optional[int] = None,
+        eval_interval: Optional[int] = None,
+        log_interval: Optional[int] = None,
+        enable_compile: Optional[bool] = None,
+    ):
         self.data_dir = Path(data_dir)
         self.tokenizer_dir = Path(tokenizer_dir)
         self.output_dir = Path(output_dir)
         self.slm_config = config.slm_config
         self.resume_from_checkpoint = resume_from_checkpoint
+        # Optional corpus override (for smoke tests or custom corpora)
+        self.corpus_path = Path(corpus_path) if corpus_path else None
+        self.max_tokens_override = max_tokens
         
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # Training parameters
-        self.batch_size = self.slm_config["batch_size"]
-        # Use full max_length to increase tokens per step
-        self.block_size = int(self.slm_config["max_length"])  
+        self.batch_size = batch_size if batch_size is not None else self.slm_config["batch_size"]
+        # Use full max_length to increase tokens per step (allow override for CPU)
+        self.block_size = int(block_size) if block_size is not None else int(self.slm_config["max_length"])  
         self.learning_rate = self.slm_config["learning_rate"]
-        self.max_iters = self.slm_config["max_steps"]
-        self.eval_interval = self.slm_config.get("eval_steps", 500)
-        self.log_interval = self.slm_config.get("logging_steps", 10)
+        self.max_iters = int(max_iters) if max_iters is not None else self.slm_config["max_steps"]
+        self.eval_interval = int(eval_interval) if eval_interval is not None else self.slm_config.get("eval_steps", 500)
+        self.log_interval = int(log_interval) if log_interval is not None else self.slm_config.get("logging_steps", 10)
         self.eval_iters = self.slm_config.get("eval_iters", 100)
         
         # Model architecture - from config
@@ -270,6 +289,28 @@ class SimpleLondonHistoricalTrainer:
         
         # System
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Determine torch.compile enablement with robust fallbacks
+        # Override from CLI if provided
+        if enable_compile is not None:
+            self.slm_config["enable_compile"] = bool(enable_compile)
+        # Auto-disable on Windows or when Triton is missing
+        self.enable_compile = bool(self.slm_config.get("enable_compile", True))
+        try:
+            import importlib.util
+            has_triton = importlib.util.find_spec("triton") is not None
+        except Exception:
+            has_triton = False
+        if platform.system() == "Windows" or not has_triton:
+            if self.enable_compile:
+                logger.warning("Disabling torch.compile (Inductor) due to platform or missing Triton; using eager mode.")
+            self.enable_compile = False
+            self.slm_config["enable_compile"] = False
+        # As an extra safety net, suppress dynamo errors so it falls back to eager
+        try:
+            import torch._dynamo as dynamo
+            dynamo.config.suppress_errors = True
+        except Exception:
+            pass
         # Precision / TF32 knobs from config
         tf32 = self.slm_config.get("enable_tf32", True)
         torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
@@ -390,30 +431,49 @@ class SimpleLondonHistoricalTrainer:
         
         # Load corpus and tokenize
         logger.info("Tokenizing corpus from scratch...")
-        corpus_file = self.data_dir / "london_historical_corpus_comprehensive.txt"
+        # Allow custom corpus override
+        corpus_file = self.corpus_path if self.corpus_path else (self.data_dir / "london_historical_corpus_comprehensive.txt")
         if not corpus_file.exists():
             raise FileNotFoundError(f"Corpus file not found: {corpus_file}")
         
-        with open(corpus_file, 'r', encoding='utf-8', errors='ignore') as f:
-            corpus_text = f.read()
-        
-        # Tokenize the entire corpus
-        logger.info("Tokenizing corpus...")
-        tokens = self.tokenizer.encode(corpus_text, add_special_tokens=False)
-        logger.info(f"Tokenized {len(tokens):,} tokens")
+        # Stream tokenization to reduce peak memory and allow early stop
+        logger.info("Tokenizing corpus (streaming)...")
+        tokens = []
+        max_tok = int(self.max_tokens_override) if self.max_tokens_override is not None else None
+        read_chars = 0
+        report_every = 5_000_000  # characters
+        try:
+            with open(corpus_file, 'r', encoding='utf-8', errors='ignore') as f:
+                while True:
+                    chunk = f.read(1_000_000)  # read ~1MB of text at a time
+                    if not chunk:
+                        break
+                    read_chars += len(chunk)
+                    chunk_toks = self.tokenizer.encode(chunk, add_special_tokens=False)
+                    tokens.extend(chunk_toks)
+                    # Early stop if max_tokens specified
+                    if max_tok is not None and len(tokens) >= max_tok:
+                        tokens = tokens[:max_tok]
+                        logger.info(f"Reached max_tokens={max_tok:,}; stopping tokenization early.")
+                        break
+                    if read_chars % report_every < 1_000_000:  # rough periodic log
+                        logger.info(f" ... streamed {read_chars:,} characters, {len(tokens):,} tokens so far")
+        except KeyboardInterrupt:
+            logger.warning("Tokenization interrupted by user; proceeding with tokens collected so far.")
+        logger.info(f"Tokenized {len(tokens):,} tokens total")
         
         # Split into train/val
         split_idx = int(0.9 * len(tokens))
         train_tokens = tokens[:split_idx]
         val_tokens = tokens[split_idx:]
-        
+
         # Save as binary files
-        data_dir.mkdir(exist_ok=True)
-        
+        data_dir.mkdir(parents=True, exist_ok=True)
+
         # Save tokenized data
         np.array(train_tokens, dtype=np.uint16).tofile(train_file)
         np.array(val_tokens, dtype=np.uint16).tofile(val_file)
-        
+
         # Save metadata
         meta = {
             'vocab_size': self.tokenizer.vocab_size,
@@ -421,13 +481,13 @@ class SimpleLondonHistoricalTrainer:
             'train_tokens': len(train_tokens),
             'val_tokens': len(val_tokens)
         }
-        
+
         with open(meta_file, 'wb') as f:
             pickle.dump(meta, f)
-        
+
         logger.info(f"Saved {len(train_tokens):,} train tokens to {train_file}")
         logger.info(f"Saved {len(val_tokens):,} val tokens to {val_file}")
-        
+
         self.data_dir = data_dir
     
     def get_batch(self, split):
@@ -493,13 +553,14 @@ class SimpleLondonHistoricalTrainer:
             device_type='cuda' if 'cuda' in self.device else 'cpu'
         )
         
-        # Compile model
-        if torch.cuda.is_available() and self.slm_config.get("enable_compile", True):
+        # Compile model (skip on platforms without Triton, e.g., Windows)
+        if torch.cuda.is_available() and self.enable_compile:
             logger.info("Compiling model...")
             try:
                 self.model = torch.compile(self.model, mode='reduce-overhead')
-            except Exception:
-                self.model = torch.compile(self.model)
+            except Exception as e:
+                logger.warning(f"torch.compile failed ({e}); falling back to eager without compilation.")
+                # Keep the original eager model without compilation
         
         # DDP wrapper
         if self.ddp:
@@ -546,9 +607,6 @@ class SimpleLondonHistoricalTrainer:
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
             logger.info("Starting training from scratch...")
-            self.start_iter = 0
-            self.best_val_loss = 1e9
-        else:
             self.start_iter = 0
             self.best_val_loss = 1e9
     
@@ -767,6 +825,24 @@ def main():
                        help="Directory to save trained model")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                        help="Path to checkpoint file to resume from")
+    # Quick-run / CPU-friendly overrides
+    parser.add_argument("--corpus_path", type=str, default=None,
+                       help="Optional path to a custom corpus file (e.g., a tiny sample) for quick runs")
+    parser.add_argument("--max_tokens", type=int, default=None,
+                       help="Optional cap on number of tokens to use when creating tokenized data")
+    parser.add_argument("--batch_size", type=int, default=None,
+                       help="Override batch size for training (useful for CPU runs)")
+    parser.add_argument("--block_size", type=int, default=None,
+                       help="Override context block size (sequence length)")
+    parser.add_argument("--max_iters", type=int, default=None,
+                       help="Override maximum training iterations (steps)")
+    parser.add_argument("--eval_interval", type=int, default=None,
+                       help="Override evaluation interval (set 0 or large to effectively disable)")
+    parser.add_argument("--logging_steps", type=int, default=None,
+                       help="Override logging interval for training progress")
+    # Toggle compilation (Inductor). On Windows/missing Triton, we auto-disable anyway.
+    parser.add_argument("--no_compile", action="store_true",
+                       help="Disable torch.compile and run in eager mode")
     
     args = parser.parse_args()
     
@@ -794,7 +870,15 @@ def main():
         data_dir=args.data_dir,
         tokenizer_dir=args.tokenizer_dir,
         output_dir=args.output_dir,
-        resume_from_checkpoint=args.resume_from_checkpoint
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        corpus_path=args.corpus_path,
+        max_tokens=args.max_tokens,
+        batch_size=args.batch_size,
+        block_size=args.block_size,
+        max_iters=args.max_iters,
+        eval_interval=args.eval_interval,
+        log_interval=args.logging_steps,
+        enable_compile=(False if args.no_compile else None),
     )
     
     # Start training
