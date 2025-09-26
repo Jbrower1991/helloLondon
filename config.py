@@ -97,7 +97,15 @@ class Config:
             "enable_tf32": True,
             "enable_amp": True,
             "amp_dtype": "bf16",
-            "enable_compile": True
+            "enable_compile": True,
+            "sampler": {
+                "type": "uniform",
+                "kwargs": {
+                    "oversample_factor": 4,
+                    "min_candidate_windows": 128,
+                    "temperature": 1.0,
+                },
+            },
         }
         
         # SLM (Small Language Model) configuration - optimized for 2x A30 GPUs (24GB each)
@@ -181,7 +189,15 @@ class Config:
             "n_positions": 512,  # Full context window
             "vocab_size": 30000,  # Match tokenizer vocabulary size
             # WandB configuration
-            "use_wandb": True  # Set to True to enable WandB logging
+            "use_wandb": True,  # Set to True to enable WandB logging
+            "sampler": {
+                "type": "uniform",
+                "kwargs": {
+                    "oversample_factor": 4,
+                    "min_candidate_windows": 128,
+                    "temperature": 1.0,
+                },
+            },
         }
         
         # Historical Tokenizer configuration (optimized for 1500-1850 English)

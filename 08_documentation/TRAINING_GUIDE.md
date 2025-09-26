@@ -294,6 +294,41 @@ cd 04_training
 python train_model.py
 ```
 
+### **Switching Between Samplers for A/B Runs**
+
+Both training scripts now accept a sampler override so you can reproduce the
+baseline run and your variance-aware experiments without editing code:
+
+- **Configuration default** – the project keeps using the original uniform sampler
+  unless you change `sampler.type` in `config.py`.
+- **CLI override** – pass `--sampler_type variance_aware` when you want to swap in
+  the variance-aware logic for either trainer.
+- **Discover available samplers** – run `python train_model_slm.py --list_samplers`
+  (or use the regular trainer) to print the registry defined in
+  `04_training/batch_samplers.py`. This makes it easy to confirm your branch is in
+  sync with the current `main` before launching experiments.
+- **Sampler kwargs** – provide additional tuning options as JSON:
+  `--sampler_kwargs '{"oversample_factor": 8, "temperature": 0.5}'` or point to a
+  JSON file.
+
+Example commands:
+
+```bash
+# Baseline SLM run (uniform sampling)
+torchrun --nproc_per_node=2 train_model_slm.py --sampler_type uniform
+
+# Variance-aware SLM run with custom oversampling factor
+torchrun --nproc_per_node=2 train_model_slm.py \
+  --sampler_type variance_aware \
+  --sampler_kwargs '{"oversample_factor": 6, "min_candidate_windows": 256}'
+
+# Regular model variance-aware run
+torchrun --nproc_per_node=2 train_model.py --sampler_type variance_aware
+```
+
+The trainers log the active sampler and kwargs at startup, making it easy to
+verify which strategy produced a given checkpoint or WandB run.
+
 ### **Automatic GPU Detection (Recommended):**
 ```bash
 cd 04_training
