@@ -21,11 +21,14 @@ from typing import Dict, Any, Optional
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Add project root to path
-project_root = Path(__file__).parent.parent
+training_dir = Path(__file__).parent
+project_root = training_dir.parent
 sys.path.append(str(project_root))
+sys.path.append(str(training_dir))
 
-# Import global configuration
+# Import global configuration and sampler utilities
 from config import config
+from batch_samplers import build_batch_sampler, get_available_sampler_names
 
 try:
     import torch
@@ -241,8 +244,16 @@ class MLP(torch.nn.Module):
 
 class LondonHistoricalTrainer:
     """Modern trainer based on nanoGPT approach - Regular model"""
-    
-    def __init__(self, data_dir: str, tokenizer_dir: str, output_dir: str, resume_from_checkpoint: str = None):
+
+    def __init__(
+        self,
+        data_dir: str,
+        tokenizer_dir: str,
+        output_dir: str,
+        resume_from_checkpoint: str = None,
+        sampler_type: Optional[str] = None,
+        sampler_kwargs: Optional[Dict[str, Any]] = None,
+    ):
         self.data_dir = Path(data_dir)
         self.tokenizer_dir = Path(tokenizer_dir)
         self.output_dir = Path(output_dir)
@@ -271,7 +282,23 @@ class LondonHistoricalTrainer:
         self.n_embd = self.training_config.get("n_embd", 1024)
         self.dropout = 0.1
         self.bias = False
-        
+
+        sampler_cfg = self.training_config.get("sampler", {})
+        default_sampler_type = sampler_cfg.get(
+            "type", self.training_config.get("sampler_type", "uniform")
+        )
+        default_sampler_kwargs = sampler_cfg.get(
+            "kwargs", self.training_config.get("sampler_kwargs", {})
+        )
+        if sampler_type is not None:
+            default_sampler_type = sampler_type
+        if sampler_kwargs:
+            merged_kwargs = {**default_sampler_kwargs, **sampler_kwargs}
+        else:
+            merged_kwargs = dict(default_sampler_kwargs)
+        self.sampler_type = default_sampler_type
+        self.sampler_kwargs = merged_kwargs
+
         # System
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         # Precision / TF32 knobs from config
@@ -307,7 +334,16 @@ class LondonHistoricalTrainer:
             self.master_process = True
             self.seed_offset = 0
             self.ddp_world_size = 1
-        
+
+        self.batch_generator = torch.Generator(device='cpu')
+        self.batch_generator.manual_seed(1337 + self.seed_offset)
+        self.batch_sampler = build_batch_sampler(self.sampler_type, **self.sampler_kwargs)
+        logger.info(
+            "Using batch sampler '%s' with kwargs=%s",
+            self.sampler_type,
+            self.sampler_kwargs,
+        )
+
         # WandB setup
         self.use_wandb = self.training_config.get("use_wandb", False) and self.master_process
         if self.use_wandb:
@@ -444,10 +480,20 @@ class LondonHistoricalTrainer:
         # Load data
         data = np.memmap(data_file, dtype=np.uint16, mode='r')
         
-        # Sample random sequences
-        ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
-        x = torch.stack([torch.from_numpy((data[i:i+self.block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i+1:i+1+self.block_size]).astype(np.int64)) for i in ix])
+        # Sample sequences through the configured sampler
+        indices = self.batch_sampler.sample(
+            data, self.block_size, self.batch_size, generator=self.batch_generator
+        )
+        ix = indices.to(torch.long)
+        x = torch.stack(
+            [torch.from_numpy((data[i : i + self.block_size]).astype(np.int64)) for i in ix]
+        )
+        y = torch.stack(
+            [
+                torch.from_numpy((data[i + 1 : i + 1 + self.block_size]).astype(np.int64))
+                for i in ix
+            ]
+        )
         
         if self.device == 'cuda':
             x, y = x.pin_memory().to(self.device, non_blocking=True), y.pin_memory().to(self.device, non_blocking=True)
@@ -780,8 +826,35 @@ def main():
                        help="Directory to save trained model")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                        help="Path to checkpoint file to resume from")
-    
+    parser.add_argument(
+        "--sampler_type",
+        type=str,
+        default=None,
+        choices=get_available_sampler_names(),
+        help="Override the sampler defined in the config",
+    )
+    parser.add_argument(
+        "--sampler_kwargs",
+        type=str,
+        default=None,
+        help=(
+            "JSON string or path to a JSON file with keyword arguments for the "
+            "selected sampler"
+        ),
+    )
+    parser.add_argument(
+        "--list_samplers",
+        action="store_true",
+        help="List the registered samplers and exit",
+    )
+
     args = parser.parse_args()
+
+    if args.list_samplers:
+        print("Available samplers:")
+        for name in get_available_sampler_names():
+            print(f" - {name}")
+        return
     
     # DDP setup
     ddp = int(os.environ.get('RANK', -1)) != -1
@@ -803,11 +876,27 @@ def main():
     torch.manual_seed(1337 + seed_offset)
     
     # Create trainer
+    sampler_kwargs = None
+    if args.sampler_kwargs:
+        potential_path = Path(args.sampler_kwargs)
+        try:
+            if potential_path.exists():
+                with open(potential_path, 'r', encoding='utf-8') as fh:
+                    sampler_kwargs = json.load(fh)
+            else:
+                sampler_kwargs = json.loads(args.sampler_kwargs)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Failed to parse --sampler_kwargs; provide a JSON string or path to a JSON file"
+            ) from exc
+
     trainer = LondonHistoricalTrainer(
         data_dir=args.data_dir,
         tokenizer_dir=args.tokenizer_dir,
         output_dir=args.output_dir,
-        resume_from_checkpoint=args.resume_from_checkpoint
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        sampler_type=args.sampler_type,
+        sampler_kwargs=sampler_kwargs,
     )
     
     # Start training
