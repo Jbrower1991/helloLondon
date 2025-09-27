@@ -230,6 +230,11 @@ Text Types: 8+ major categories
 - **Device Safety**: CPU evaluation during training to avoid GPU conflicts
 - **Automatic GPU Detection**: Smart GPU configuration and fallback
 
+### **Sampler Ablations**
+- **Reusable Sweep Launcher**: `python 10_scripts/run_sampler_ablation.py --dry-run`
+- **Uniform vs. PBit Comparison**: Generates a manifest plus per-run folders under `outputs/ablations/`
+- **Custom Grids & Variants**: Accepts JSON grids/variant files and forwards additional trainer CLI args after `--`
+
 ### **Data Collection**
 - **Archive.org Integration**: Automated download from 99+ sources
 - **Failed Download Recovery**: Manual retry system for failed downloads
