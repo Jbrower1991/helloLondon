@@ -29,6 +29,9 @@ class PBitConfig:
     """Configuration knobs for the variance-aware sampler."""
 
     heavy_refresh_interval: int = 50
+    # Optional cap on number of windows to process during heavy refresh.
+    # When None, uses all windows. Useful to accelerate smoke tests.
+    heavy_refresh_window_cap: Optional[int] = None
     shortlist_seed_size: int = 128
     shortlist_knn: int = 8
     shortlist_cap: int = 1024
@@ -100,6 +103,7 @@ class PBitVarianceAwareSampler(BaseBatchSampler):
         self,
         *,
         heavy_refresh_interval: int = 50,
+        heavy_refresh_window_cap: Optional[int] = None,
         shortlist_seed_size: int = 128,
         shortlist_knn: int = 8,
         shortlist_cap: int = 1024,
@@ -116,6 +120,7 @@ class PBitVarianceAwareSampler(BaseBatchSampler):
     ) -> None:
         self.config = PBitConfig(
             heavy_refresh_interval=heavy_refresh_interval,
+            heavy_refresh_window_cap=heavy_refresh_window_cap,
             shortlist_seed_size=shortlist_seed_size,
             shortlist_knn=shortlist_knn,
             shortlist_cap=shortlist_cap,
@@ -164,39 +169,52 @@ class PBitVarianceAwareSampler(BaseBatchSampler):
             self.state.group_ids = torch.zeros(total_windows, dtype=torch.long)
 
     def _compute_window_features(
-        self, data: np.memmap, block_size: int
+        self, data: np.memmap, block_size: int, indices: Optional[Sequence[int]] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        total_windows = max(1, len(data) - block_size)
-        lengths = torch.zeros(total_windows, dtype=torch.float32)
-        entropy = torch.zeros_like(lengths)
-        mi_proxy = torch.zeros_like(lengths)
-        variance = torch.zeros_like(lengths)
+        """Compute per-window features for the given subset of indices.
 
-        for idx in range(total_windows):
+        Returns tensors of shape [N] corresponding to the provided indices order.
+        """
+        total_windows = max(1, len(data) - block_size)
+        if indices is None:
+            indices = list(range(total_windows))
+        N = len(indices)
+        lengths = torch.zeros(N, dtype=torch.float32)
+        entropy = torch.zeros(N, dtype=torch.float32)
+        mi_proxy = torch.zeros(N, dtype=torch.float32)
+        variance = torch.zeros(N, dtype=torch.float32)
+
+        for i, idx in enumerate(indices):
+            if idx < 0 or idx >= total_windows:
+                continue
             window = np.asarray(data[idx : idx + block_size], dtype=np.int64)
             valid_len = window.size
             if valid_len == 0:
                 continue
-            lengths[idx] = float(valid_len)
-            variance[idx] = float(np.var(window))
+            lengths[i] = float(valid_len)
+            variance[i] = float(np.var(window))
             values, counts = np.unique(window, return_counts=True)
             probs = counts / counts.sum()
-            entropy[idx] = float(-(probs * np.log2(np.clip(probs, 1e-12, 1))).sum())
+            entropy[i] = float(-(probs * np.log2(np.clip(probs, 1e-12, 1))).sum())
             if valid_len > 1:
                 diffs = np.diff(window.astype(np.float32))
-                mi_proxy[idx] = float(np.mean(np.abs(diffs)))
+                mi_proxy[i] = float(np.mean(np.abs(diffs)))
 
         return lengths, entropy, mi_proxy, variance
 
-    def _rarity_scores(self, data: np.memmap, block_size: int) -> torch.Tensor:
+    def _rarity_scores(
+        self, data: np.memmap, block_size: int, indices: Optional[Sequence[int]] = None
+    ) -> torch.Tensor:
         total_windows = max(1, len(data) - block_size)
-        rarity = torch.ones(total_windows, dtype=torch.float32)
+        if indices is None:
+            indices = list(range(total_windows))
+        rarity = torch.ones(len(indices), dtype=torch.float32)
         bucket_state = self.state.rarity_buckets
         assert bucket_state is not None
-        for idx in range(total_windows):
+        for i, idx in enumerate(indices):
             token = int(data[idx]) if idx < len(data) else 0
             bucket = token % self.config.rarity_bucket_count
-            rarity[idx] = 1.0 / bucket_state[bucket].clamp_min(self.config.epsilon)
+            rarity[i] = 1.0 / bucket_state[bucket].clamp_min(self.config.epsilon)
         return rarity
 
     def _rank_normalise(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -289,24 +307,41 @@ class PBitVarianceAwareSampler(BaseBatchSampler):
 
     def _heavy_refresh(self, data: np.memmap, block_size: int) -> None:
         total_windows = max(1, len(data) - block_size)
+        # Optionally cap the number of windows considered to accelerate refresh
+        if (
+            self.config.heavy_refresh_window_cap is not None
+            and self.config.heavy_refresh_window_cap > 0
+            and total_windows > self.config.heavy_refresh_window_cap
+        ):
+            # Evenly spaced selection to cover full range deterministically
+            step = total_windows / float(self.config.heavy_refresh_window_cap)
+            indices = [int(i * step) for i in range(self.config.heavy_refresh_window_cap)]
+            indices = sorted(set(min(idx, total_windows - 1) for idx in indices))
+        else:
+            indices = list(range(total_windows))
+
         lengths, entropy, mi_proxy, variance = self._compute_window_features(
-            data, block_size
+            data, block_size, indices
         )
-        rarity = self._rarity_scores(data, block_size)
+        rarity = self._rarity_scores(data, block_size, indices)
         features = torch.stack([lengths, entropy, mi_proxy, rarity], dim=1)
 
         rank_features = torch.stack(
             [self._rank_normalise(col) for col in features.t()], dim=1
         )
         scores = self._combine_scores(rank_features)
-        shortlist_indices, shortlist_scores, similarity = self._build_shortlist(
-            scores, rank_features, total_windows
+        shortlist_local_idx, shortlist_scores, similarity = self._build_shortlist(
+            scores, rank_features, len(indices)
         )
+
+        # Map shortlist indices back to absolute window offsets
+        index_map = torch.tensor(indices, dtype=torch.long)
+        shortlist_abs_idx = index_map[shortlist_local_idx]
 
         self.state.feature_tensor = features
         self.state.rank_features = rank_features
         self.state.scores = scores
-        self.state.shortlist_indices = shortlist_indices
+        self.state.shortlist_indices = shortlist_abs_idx
         self.state.shortlist_scores = shortlist_scores
         self.state.shortlist_similarity = similarity
         self.state.last_refresh_step = self.state.step
@@ -316,7 +351,7 @@ class PBitVarianceAwareSampler(BaseBatchSampler):
             self.state.group_ids = group_ids
 
         logger.debug(
-            "Heavy refresh complete: shortlist=%s entries", shortlist_indices.numel()
+            "Heavy refresh complete: shortlist=%s entries", shortlist_abs_idx.numel()
         )
 
     def _resolve_groups(

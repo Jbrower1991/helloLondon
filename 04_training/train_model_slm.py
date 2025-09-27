@@ -303,12 +303,14 @@ class SimpleLondonHistoricalTrainer:
         )
         if sampler_type is not None:
             default_sampler_type = sampler_type
-        if sampler_kwargs:
-            merged_kwargs = {**default_sampler_kwargs, **sampler_kwargs}
+        # If CLI provided --sampler_kwargs, use them as-is to avoid passing
+        # unsupported keys from config defaults when sampler APIs evolve.
+        if sampler_kwargs is not None:
+            effective_kwargs = dict(sampler_kwargs)
         else:
-            merged_kwargs = dict(default_sampler_kwargs)
+            effective_kwargs = dict(default_sampler_kwargs)
         self.sampler_type = default_sampler_type
-        self.sampler_kwargs = merged_kwargs
+        self.sampler_kwargs = effective_kwargs
 
         # System
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -963,8 +965,6 @@ def main():
         eval_interval=args.eval_interval,
         log_interval=args.logging_steps,
         enable_compile=(False if args.no_compile else None),
-        sampler_type=args.sampler_type,
-        sampler_kwargs=sampler_kwargs,
         sampler_type=args.sampler_type,
         sampler_kwargs=sampler_kwargs,
     )

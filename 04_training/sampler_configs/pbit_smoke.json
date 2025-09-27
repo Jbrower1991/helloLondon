@@ -1,0 +1,14 @@
+{
+  "heavy_refresh_interval": 50,
+  "heavy_refresh_window_cap": 1000,
+  "shortlist_seed_size": 64,
+  "shortlist_knn": 8,
+  "shortlist_cap": 256,
+  "sketch_dim": 64,
+  "rarity_bucket_count": 4096,
+  "rarity_ema": 0.01,
+  "feature_weights": [0.25, 0.25, 0.25, 0.25],
+  "diversity_strength": 0.5,
+  "temperature": 1.0,
+  "log_interval": 100
+}
